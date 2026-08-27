@@ -21,8 +21,11 @@ func NewFilter(child Iterator, pred Expr) *Filter {
 func (f *Filter) Schema() Schema { return f.child.Schema() }
 
 func (f *Filter) Open() error {
+	if err := f.child.Open(); err != nil {
+		return err
+	}
 	f.schema = f.child.Schema()
-	return f.child.Open()
+	return nil
 }
 
 func (f *Filter) Next() (Row, bool) {
@@ -74,8 +77,11 @@ func NewProject(child Iterator, projections ...Projection) *Project {
 func (p *Project) Schema() Schema { return p.outSchema }
 
 func (p *Project) Open() error {
+	if err := p.child.Open(); err != nil {
+		return err
+	}
 	p.inSchema = p.child.Schema()
-	return p.child.Open()
+	return nil
 }
 
 func (p *Project) Next() (Row, bool) {
