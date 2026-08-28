@@ -229,3 +229,46 @@ func (o *OrderBy) Next() (Row, bool) {
 	o.cursor++
 	return row, true
 }
+
+// -------------------------------------------------------------------------
+// Distinct — removes duplicate rows (based on all column values)
+// -------------------------------------------------------------------------
+
+// Distinct filters out duplicate rows from its child iterator.
+// It buffers the full output in memory and uses a string-key set for dedup.
+type Distinct struct {
+	child  Iterator
+	seen   map[string]struct{}
+	schema Schema
+}
+
+func NewDistinct(child Iterator) *Distinct {
+	return &Distinct{child: child}
+}
+
+func (d *Distinct) Schema() Schema { return d.child.Schema() }
+func (d *Distinct) Close() error   { d.seen = nil; return d.child.Close() }
+
+func (d *Distinct) Open() error {
+	if err := d.child.Open(); err != nil {
+		return err
+	}
+	d.schema = d.child.Schema()
+	d.seen = make(map[string]struct{})
+	return nil
+}
+
+func (d *Distinct) Next() (Row, bool) {
+	for {
+		row, ok := d.child.Next()
+		if !ok {
+			return nil, false
+		}
+		key := row.String()
+		if _, dup := d.seen[key]; dup {
+			continue
+		}
+		d.seen[key] = struct{}{}
+		return row, true
+	}
+}

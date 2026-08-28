@@ -264,3 +264,12 @@ func (s *RangeScan) Close() error {
 	s.rows = nil
 	return nil
 }
+
+// PKCols returns the primary key column names in order.
+func (t *Table) PKCols() []string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	cp := make([]string, len(t.pkCols))
+	copy(cp, t.pkCols)
+	return cp
+}

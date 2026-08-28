@@ -744,3 +744,79 @@ func TestExecLargeTable(t *testing.T) {
 		t.Fatalf("groups=%d want 2", len(res.Rows))
 	}
 }
+
+// -------------------------------------------------------------------------
+// Bug fix tests
+// -------------------------------------------------------------------------
+
+func TestExecDeleteCompositePK(t *testing.T) {
+	db := NewDatabase()
+	Exec(db, `CREATE TABLE orders (
+		customer_id INT PRIMARY KEY,
+		order_id    INT PRIMARY KEY,
+		amount      FLOAT
+	)`)
+	Exec(db, "INSERT INTO orders (customer_id, order_id, amount) VALUES (1, 100, 50.0)")
+	Exec(db, "INSERT INTO orders (customer_id, order_id, amount) VALUES (1, 101, 75.0)")
+	Exec(db, "INSERT INTO orders (customer_id, order_id, amount) VALUES (2, 100, 30.0)")
+
+	res, err := Exec(db, "DELETE FROM orders WHERE customer_id = 1 AND order_id = 100")
+	if err != nil {
+		t.Fatalf("DELETE composite PK: %v", err)
+	}
+	if res.RowsAffected != 1 {
+		t.Fatalf("affected=%d want 1", res.RowsAffected)
+	}
+	sel, _ := Exec(db, "SELECT * FROM orders")
+	if len(sel.Rows) != 2 {
+		t.Fatalf("rows after delete=%d want 2: %v", len(sel.Rows), sel.Rows)
+	}
+}
+
+func TestExecDistinct(t *testing.T) {
+	db := makeTestDB(t)
+	res, err := Exec(db, "SELECT DISTINCT dept FROM employees ORDER BY dept")
+	if err != nil {
+		t.Fatalf("DISTINCT: %v", err)
+	}
+	// Eng, HR, Mgmt — 3 distinct depts
+	if len(res.Rows) != 3 {
+		t.Fatalf("distinct depts=%d want 3: %v", len(res.Rows), res.Rows)
+	}
+	if res.Rows[0][0].AsText() != "Eng" {
+		t.Fatalf("first dept=%v want Eng", res.Rows[0][0])
+	}
+}
+
+func TestExecHavingCount(t *testing.T) {
+	db := makeTestDB(t)
+	// Departments with more than 1 employee
+	res, err := Exec(db, "SELECT dept, COUNT(*) AS cnt FROM employees GROUP BY dept HAVING COUNT(*) > 1")
+	if err != nil {
+		t.Fatalf("HAVING: %v", err)
+	}
+	// Eng (3) and HR (2) qualify; Mgmt (1) does not
+	if len(res.Rows) != 2 {
+		t.Fatalf("groups with cnt>1: %d want 2: %v", len(res.Rows), res.Rows)
+	}
+	for _, row := range res.Rows {
+		if row[1].AsInt() <= 1 {
+			t.Fatalf("HAVING failed: dept %v has cnt=%v", row[0], row[1])
+		}
+	}
+}
+
+func TestExecDistinctAllSame(t *testing.T) {
+	db := NewDatabase()
+	Exec(db, "CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+	Exec(db, "INSERT INTO t (id, val) VALUES (1, 'x')")
+	Exec(db, "INSERT INTO t (id, val) VALUES (2, 'x')")
+	Exec(db, "INSERT INTO t (id, val) VALUES (3, 'x')")
+	res, err := Exec(db, "SELECT DISTINCT val FROM t")
+	if err != nil {
+		t.Fatalf("DISTINCT all same: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("rows=%d want 1", len(res.Rows))
+	}
+}

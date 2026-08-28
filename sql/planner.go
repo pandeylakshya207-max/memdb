@@ -217,7 +217,12 @@ func execSelect(db *Database, s *SelectStmt) (*ExecResult, error) {
 		outSchema = newSchema
 	}
 
-	// 8. OFFSET / LIMIT.
+	// 8. DISTINCT (after project, before limit/offset).
+	if s.Distinct {
+		base = query.NewDistinct(base)
+	}
+
+	// 9. OFFSET / LIMIT.
 	if s.Offset != nil {
 		base = query.NewOffset(base, int(*s.Offset))
 	}
@@ -676,7 +681,7 @@ func execDelete(db *Database, s *DeleteStmt) (*ExecResult, error) {
 
 	affected := 0
 	for _, row := range rows {
-		pkVals := extractPKVal(row, schema)
+		pkVals := extractPKVal(tbl, row, schema)
 		if tbl.Delete(pkVals...) {
 			affected++
 		}
@@ -754,12 +759,19 @@ func evalLitOrCol(e Expr, row query.Row, schema query.Schema) (query.Value, erro
 	return qe.Eval(row, schema), nil
 }
 
-// extractPKVal returns the first column value as the PK (single-column PK assumption).
-func extractPKVal(row query.Row, schema query.Schema) []query.Value {
-	if len(row) == 0 {
-		return nil
+// extractPKVal extracts primary key values from a row using the table's PK column list.
+func extractPKVal(tbl *query.Table, row query.Row, schema query.Schema) []query.Value {
+	pkCols := tbl.PKCols()
+	vals := make([]query.Value, len(pkCols))
+	for i, name := range pkCols {
+		idx := schema.Index(name)
+		if idx >= 0 && idx < len(row) {
+			vals[i] = row[idx]
+		} else {
+			vals[i] = query.Null()
+		}
 	}
-	return []query.Value{row[0]}
+	return vals
 }
 
 // buildPostAggSchema constructs the schema that HashAggregate will produce,
