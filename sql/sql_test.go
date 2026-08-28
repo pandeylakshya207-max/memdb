@@ -820,3 +820,110 @@ func TestExecDistinctAllSame(t *testing.T) {
 		t.Fatalf("rows=%d want 1", len(res.Rows))
 	}
 }
+
+// -------------------------------------------------------------------------
+// Gap fix tests
+// -------------------------------------------------------------------------
+
+func TestHavingAggNotInSelect(t *testing.T) {
+	db := makeTestDB(t)
+	// HAVING uses SUM(salary) which is NOT in the SELECT list.
+	res, err := Exec(db, `SELECT dept FROM employees GROUP BY dept HAVING SUM(salary) > 200000.0`)
+	if err != nil {
+		t.Fatalf("HAVING agg not in SELECT: %v", err)
+	}
+	// Eng: 90k+80k+95k = 265k > 200k ✓
+	// HR: 70k+65k = 135k — no
+	// Mgmt: 120k — no
+	if len(res.Rows) != 1 {
+		t.Fatalf("rows=%d want 1: %v", len(res.Rows), res.Rows)
+	}
+	if res.Rows[0][0].AsText() != "Eng" {
+		t.Fatalf("dept=%v want Eng", res.Rows[0][0])
+	}
+}
+
+func TestHavingWithCountNotInSelect(t *testing.T) {
+	db := makeTestDB(t)
+	// HAVING COUNT(*) > 2 but SELECT only has dept.
+	res, err := Exec(db, `SELECT dept FROM employees GROUP BY dept HAVING COUNT(*) > 2`)
+	if err != nil {
+		t.Fatalf("HAVING COUNT(*) not in SELECT: %v", err)
+	}
+	// Only Eng has 3 employees.
+	if len(res.Rows) != 1 || res.Rows[0][0].AsText() != "Eng" {
+		t.Fatalf("rows=%v want [Eng]", res.Rows)
+	}
+}
+
+func TestPrintExprStringEscaping(t *testing.T) {
+	// PrintExpr must escape single quotes for SQL round-trip.
+	expr := &LitExpr{Kind: LitStr, StrVal: "it's a test"}
+	printed := PrintExpr(expr)
+	if printed != "'it''s a test'" {
+		t.Fatalf("PrintExpr string escaping: got %q want %q", printed, "'it''s a test'")
+	}
+	// Must parse back correctly.
+	stmt, err := Parse("SELECT * FROM t WHERE name = " + printed)
+	if err != nil {
+		t.Fatalf("round-trip parse: %v", err)
+	}
+	sel := stmt.(*SelectStmt)
+	bin := sel.Where.(*BinaryExpr)
+	lit := bin.Right.(*LitExpr)
+	if lit.StrVal != "it's a test" {
+		t.Fatalf("round-trip value: got %q want %q", lit.StrVal, "it's a test")
+	}
+}
+
+func TestPrintExprComplexWhere(t *testing.T) {
+	// Complex WHERE with AND/OR nesting must round-trip.
+	original := "SELECT * FROM t WHERE (a > 1 AND b < 10) OR c = TRUE"
+	stmt, err := Parse(original)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	sel := stmt.(*SelectStmt)
+	printed := PrintExpr(sel.Where)
+	// Re-parse the printed WHERE.
+	stmt2, err := Parse("SELECT * FROM t WHERE " + printed)
+	if err != nil {
+		t.Fatalf("re-parse printed WHERE %q: %v", printed, err)
+	}
+	// Both should produce the same structure.
+	sel2 := stmt2.(*SelectStmt)
+	if PrintExpr(sel2.Where) != printed {
+		t.Fatalf("not idempotent: first=%q second=%q", printed, PrintExpr(sel2.Where))
+	}
+}
+
+func TestDeleteWithComplexWhere(t *testing.T) {
+	db := makeTestDB(t)
+	// DELETE with AND expression — exercises PrintExpr round-trip in db.execDelete pre-scan.
+	res, err := Exec(db, "DELETE FROM employees WHERE dept = 'HR' AND salary < 70000.0")
+	if err != nil {
+		t.Fatalf("DELETE complex WHERE: %v", err)
+	}
+	// Only Dave (HR, 65k) matches.
+	if res.RowsAffected != 1 {
+		t.Fatalf("affected=%d want 1", res.RowsAffected)
+	}
+}
+
+func TestDeleteWithStringContainingQuote(t *testing.T) {
+	db := NewDatabase()
+	Exec(db, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+	Exec(db, "INSERT INTO t (id, name) VALUES (1, 'it''s Alice')")
+	Exec(db, "INSERT INTO t (id, name) VALUES (2, 'Bob')")
+	res, err := Exec(db, "DELETE FROM t WHERE name = 'it''s Alice'")
+	if err != nil {
+		t.Fatalf("DELETE with quoted string: %v", err)
+	}
+	if res.RowsAffected != 1 {
+		t.Fatalf("affected=%d want 1", res.RowsAffected)
+	}
+	sel, _ := Exec(db, "SELECT * FROM t")
+	if len(sel.Rows) != 1 || sel.Rows[0][0].AsInt() != 2 {
+		t.Fatalf("wrong row survived: %v", sel.Rows)
+	}
+}

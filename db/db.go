@@ -196,23 +196,43 @@ func (d *DB) execInsert(rawSQL string, s *dbsql.InsertStmt) (*dbsql.ExecResult, 
 }
 
 func (d *DB) execUpdate(rawSQL string, s *dbsql.UpdateStmt) (*dbsql.ExecResult, error) {
-	// Apply first, then WAL the new state of all affected rows.
+	tbl, ok := d.sqlDB.Table(s.Table)
+	if !ok {
+		return nil, fmt.Errorf("table %q does not exist", s.Table)
+	}
+
+	// Snapshot PKs of rows that will be affected BEFORE the update,
+	// so we log only the changed rows (not the whole table).
+	var matchedPKs [][]query.Value
+	if s.Where != nil {
+		whereSQL := "SELECT * FROM " + s.Table + " WHERE " + dbsql.PrintExpr(s.Where)
+		if pre, err := dbsql.Exec(d.sqlDB, whereSQL); err == nil {
+			for _, row := range pre.Rows {
+				matchedPKs = append(matchedPKs, extractPKVal(tbl, row, tbl.Schema()))
+			}
+		}
+	} else {
+		// No WHERE — all rows will be updated.
+		rows, _ := query.Collect(query.NewTableScan(tbl))
+		for _, row := range rows {
+			matchedPKs = append(matchedPKs, extractPKVal(tbl, row, tbl.Schema()))
+		}
+	}
+
+	// Apply the update.
 	res, err := dbsql.Exec(d.sqlDB, rawSQL)
 	if err != nil {
 		return nil, err
 	}
-	// Re-scan the whole table and log every row as an INSERT (upsert).
-	// This is safe because WAL replay uses Upsert — replaying an extra row
-	// is idempotent. We only do this for small tables; a production system
-	// would track changed rows explicitly.
-	tbl, ok := d.sqlDB.Table(s.Table)
-	if !ok {
-		return res, nil
-	}
-	rows, _ := query.Collect(query.NewTableScan(tbl))
+
+	// WAL only the updated rows (their new state) by re-fetching each by PK.
 	name := strings.ToLower(s.Table)
-	for _, row := range rows {
-		if err := d.walAppend(name, rowOpInsert, row); err != nil {
+	for _, pkVals := range matchedPKs {
+		newRow, found := tbl.Get(pkVals...)
+		if !found {
+			continue
+		}
+		if err := d.walAppend(name, rowOpInsert, newRow); err != nil {
 			return nil, fmt.Errorf("UPDATE WAL: %w", err)
 		}
 	}
@@ -504,4 +524,114 @@ func litToValue(e dbsql.Expr) query.Value {
 		return query.Bool(lit.BoolVal)
 	}
 	return query.Null()
+}
+
+// -------------------------------------------------------------------------
+// WAL compaction
+// -------------------------------------------------------------------------
+
+// Compact rewrites the WAL for table as a clean snapshot of the current
+// in-memory state, discarding all historical records.
+// After compaction the WAL contains exactly one INSERT record per live row.
+// This keeps WAL size proportional to the number of rows, not the number
+// of writes.
+//
+// Compact is safe to call at any time. It is a no-op if the table does not
+// exist. For best results call it periodically or after bulk operations.
+func (d *DB) Compact(table string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.compactLocked(strings.ToLower(table))
+}
+
+// CompactAll compacts all tables.
+func (d *DB) CompactAll() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for name := range d.catalog {
+		if err := d.compactLocked(name); err != nil {
+			return fmt.Errorf("CompactAll %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func (d *DB) compactLocked(name string) error {
+	tbl, ok := d.sqlDB.Table(name)
+	if !ok {
+		return nil
+	}
+
+	// Collect all live rows.
+	rows, err := query.Collect(query.NewTableScan(tbl))
+	if err != nil {
+		return fmt.Errorf("compact scan: %w", err)
+	}
+
+	// Close the old WAL file.
+	if f, ok := d.walFiles[name]; ok {
+		if err := f.Sync(); err != nil {
+			return err
+		}
+		f.Close()
+		delete(d.walFiles, name)
+	}
+
+	// Truncate the WAL file (rewrite from scratch).
+	wp := d.walPath(name)
+	f, err := os.OpenFile(wp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("compact open: %w", err)
+	}
+
+	// Write one INSERT per live row.
+	for _, row := range rows {
+		buf := marshalRow(rowOpInsert, row)
+		if _, err := f.Write(buf); err != nil {
+			f.Close()
+			return fmt.Errorf("compact write: %w", err)
+		}
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+
+	// Reopen for appending.
+	f.Close()
+	newF, err := os.OpenFile(wp, os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("compact reopen: %w", err)
+	}
+	d.walFiles[name] = newF
+	return nil
+}
+
+// WALSize returns the current WAL file size in bytes for table.
+// Returns 0 if the table does not exist or has no WAL.
+func (d *DB) WALSize(table string) int64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	wp := d.walPath(strings.ToLower(table))
+	info, err := os.Stat(wp)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
+// extractPKVal extracts primary key column values from a row using the
+// table's PK column list.
+func extractPKVal(tbl *query.Table, row query.Row, schema query.Schema) []query.Value {
+	pkCols := tbl.PKCols()
+	vals := make([]query.Value, len(pkCols))
+	for i, name := range pkCols {
+		idx := schema.Index(name)
+		if idx >= 0 && idx < len(row) {
+			vals[i] = row[idx]
+		} else {
+			vals[i] = query.Null()
+		}
+	}
+	return vals
 }

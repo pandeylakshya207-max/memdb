@@ -303,3 +303,110 @@ func TestDeleteAllAndReopen(t *testing.T) {
 		t.Fatalf("after delete-all+reopen: %d rows want 0", n)
 	}
 }
+
+// -------------------------------------------------------------------------
+// Gap fix tests
+// -------------------------------------------------------------------------
+
+func TestUpdateWALOnlyChangedRows(t *testing.T) {
+	dir := tmpDir(t)
+	db, _ := Open(dir)
+	mustExec(t, db, "CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+	for i := 1; i <= 10; i++ {
+		mustExec(t, db, fmt.Sprintf("INSERT INTO t (id, val) VALUES (%d, %d)", i, i*10))
+	}
+
+	// Record WAL size before update.
+	sizeBefore := db.WALSize("t")
+
+	// Update only 1 row out of 10.
+	mustExec(t, db, "UPDATE t SET val = 999 WHERE id = 5")
+	sizeAfter := db.WALSize("t")
+
+	// The WAL growth should be ~1 record, not 10.
+	// Each row record ≈ 5 + 3*13 bytes ≈ 44 bytes. One row ≈ 44, ten rows ≈ 440.
+	growth := sizeAfter - sizeBefore
+	if growth > 200 {
+		t.Fatalf("UPDATE WAL wrote too much: grew by %d bytes (want ~44 for 1 row)", growth)
+	}
+	db.Close()
+
+	// Verify the update persisted correctly.
+	db2, _ := Open(dir)
+	defer db2.Close()
+	res, _ := db2.Exec("SELECT val FROM t WHERE id = 5")
+	if len(res.Rows) != 1 || res.Rows[0][0].AsInt() != 999 {
+		t.Fatalf("update not persisted: %v", res.Rows)
+	}
+	// Other rows unchanged.
+	res2, _ := db2.Exec("SELECT val FROM t WHERE id = 1")
+	if len(res2.Rows) != 1 || res2.Rows[0][0].AsInt() != 10 {
+		t.Fatalf("untouched row changed: %v", res2.Rows)
+	}
+}
+
+func TestWALCompaction(t *testing.T) {
+	dir := tmpDir(t)
+	db, _ := Open(dir)
+	mustExec(t, db, "CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+
+	// Insert 100 rows, update each once → WAL has 200 records.
+	for i := 1; i <= 100; i++ {
+		mustExec(t, db, fmt.Sprintf("INSERT INTO t (id, val) VALUES (%d, %d)", i, i))
+	}
+	for i := 1; i <= 100; i++ {
+		mustExec(t, db, fmt.Sprintf("UPDATE t SET val = %d WHERE id = %d", i*100, i))
+	}
+
+	sizeBefore := db.WALSize("t")
+	if sizeBefore == 0 {
+		t.Fatal("WAL size should be > 0 before compaction")
+	}
+
+	// Compact — WAL should shrink to exactly 100 records (one per live row).
+	if err := db.Compact("t"); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	sizeAfter := db.WALSize("t")
+	if sizeAfter >= sizeBefore {
+		t.Fatalf("Compact didn't reduce WAL: before=%d after=%d", sizeBefore, sizeAfter)
+	}
+
+	db.Close()
+
+	// Data must still be correct after compaction + reopen.
+	db2, _ := Open(dir)
+	defer db2.Close()
+	if n := rowCount(t, db2, "t"); n != 100 {
+		t.Fatalf("after compact+reopen: %d rows want 100", n)
+	}
+	res, _ := db2.Exec("SELECT val FROM t WHERE id = 50")
+	if len(res.Rows) != 1 || res.Rows[0][0].AsInt() != 5000 {
+		t.Fatalf("val for id=50: %v want 5000", res.Rows)
+	}
+}
+
+func TestCompactAll(t *testing.T) {
+	dir := tmpDir(t)
+	db, _ := Open(dir)
+	mustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, v INT)")
+	mustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, v TEXT)")
+	for i := 1; i <= 20; i++ {
+		mustExec(t, db, fmt.Sprintf("INSERT INTO a (id, v) VALUES (%d, %d)", i, i))
+		mustExec(t, db, fmt.Sprintf("INSERT INTO b (id, v) VALUES (%d, 'x%d')", i, i))
+	}
+	// Update all — bloats WAL.
+	for i := 1; i <= 20; i++ {
+		mustExec(t, db, fmt.Sprintf("UPDATE a SET v = %d WHERE id = %d", i*10, i))
+	}
+	if err := db.CompactAll(); err != nil {
+		t.Fatalf("CompactAll: %v", err)
+	}
+	db.Close()
+
+	db2, _ := Open(dir)
+	defer db2.Close()
+	if rowCount(t, db2, "a") != 20 || rowCount(t, db2, "b") != 20 {
+		t.Fatal("wrong row count after CompactAll+reopen")
+	}
+}

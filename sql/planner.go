@@ -173,13 +173,22 @@ func execSelect(db *Database, s *SelectStmt) (*ExecResult, error) {
 			aggSpecs = append(aggSpecs, query.AggSpec{Func: fn, Input: inputExpr, Output: name})
 			aggMaps = append(aggMaps, aggMapping{sqlExpr: agg, outName: name})
 		}
-		// Also extract aggs referenced in HAVING.
+		// Also extract aggs referenced in HAVING that aren't in SELECT.
 		if s.Having != nil {
 			havingAggs, err := extractHavingAggSpecs(s.Having, baseSchema, aggMaps)
 			if err != nil {
 				return nil, fmt.Errorf("HAVING agg: %w", err)
 			}
-			aggSpecs = append(aggSpecs, havingAggs...)
+			// Add to both aggSpecs (for HashAggregate) and aggMaps (for
+			// planExprWithAggMap so HAVING can reference the output column).
+			for _, spec := range havingAggs {
+				aggSpecs = append(aggSpecs, spec)
+				// Find the original AggExpr from HAVING to build the mapping.
+				havingAggExpr := findAggExprByName(s.Having, spec.Output)
+				if havingAggExpr != nil {
+					aggMaps = append(aggMaps, aggMapping{sqlExpr: havingAggExpr, outName: spec.Output})
+				}
+			}
 		}
 		base = query.NewHashAggregate(base, s.GroupBy, aggSpecs...)
 		// Build postAggSchema eagerly (same logic as HashAggregate.Open) so
@@ -788,4 +797,28 @@ func buildPostAggSchema(inSchema query.Schema, groupBy []string, aggSpecs []quer
 		cols = append(cols, query.Column{Name: spec.Output, Type: query.TypeNull})
 	}
 	return query.Schema{Columns: cols}
+}
+
+// findAggExprByName walks expr looking for an AggExpr whose defaultAggName
+// matches name. Used to link HAVING-only aggregates back to their AggExpr.
+func findAggExprByName(e Expr, name string) *AggExpr {
+	if e == nil {
+		return nil
+	}
+	switch n := e.(type) {
+	case *AggExpr:
+		if defaultAggName(n) == name {
+			return n
+		}
+	case *BinaryExpr:
+		if r := findAggExprByName(n.Left, name); r != nil {
+			return r
+		}
+		return findAggExprByName(n.Right, name)
+	case *UnaryExpr:
+		return findAggExprByName(n.Expr, name)
+	case *IsNullExpr:
+		return findAggExprByName(n.Expr, name)
+	}
+	return nil
 }

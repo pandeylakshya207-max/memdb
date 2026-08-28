@@ -771,7 +771,9 @@ func PrintExpr(e Expr) string {
 		case LitFloat:
 			return fmt.Sprintf("%g", n.FltVal)
 		case LitStr:
-			return fmt.Sprintf("'%s'", n.StrVal)
+			// Escape single quotes for SQL round-trip.
+			escaped := strings.ReplaceAll(n.StrVal, "'", "''")
+			return "'" + escaped + "'"
 		case LitBool:
 			if n.BoolVal {
 				return "TRUE"
