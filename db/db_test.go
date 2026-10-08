@@ -186,6 +186,14 @@ func TestCrashRecovery(t *testing.T) {
 		f.Sync()
 	}
 	// Leave db open (simulated crash).
+	// Release the abandoned file handles when the test ends so the temp
+	// directory can be removed; Windows cannot delete open files. This runs
+	// after the assertions and deliberately bypasses the clean-shutdown path.
+	t.Cleanup(func() {
+		for _, f := range db.walFiles {
+			f.Close()
+		}
+	})
 
 	db2, err := Open(dir)
 	if err != nil {
