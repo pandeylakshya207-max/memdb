@@ -3,16 +3,18 @@
 //
 // Design decisions:
 //   - Separate chaining: each bucket holds a singly-linked list of entries.
-//     Simpler to implement correctly under rehash than open-addressing, and
-//     avoids clustering.
 //   - Striped locking: the table is divided into NStripes shards, each
-//     protected by its own sync.RWMutex.  Reads (Get) take the shard read-lock;
-//     writes (Set, Delete) take the shard write-lock.  Rehash takes ALL shard
-//     write-locks in index order to avoid deadlock.
-//   - Load-factor-triggered rehash: when the global item count exceeds
-//     loadFactor * capacity the table doubles.  Shrink triggers at 0.25 * capacity
-//     (but never below minBuckets).
-//   - FNV-1a hash for string keys; a pluggable Hasher interface for other types.
+//     protected by its own sync.RWMutex. Get takes the shard read-lock; Set
+//     and Delete take the shard write-lock. Rehash takes every shard
+//     write-lock, in index order, before it replaces the backing array.
+//   - Generation check: an operation reads the backing array first and locks
+//     its stripe second, so a rehash can slip in between. Each operation
+//     therefore re-checks the table generation once it holds the stripe lock
+//     and retries if the table was replaced.
+//   - Load-factor-triggered rehash: the table doubles when items/buckets
+//     exceeds maxLoadFactor and halves when it falls low enough, never below
+//     minBuckets.
+//   - A pluggable Hasher maps keys to uint64 hashes.
 //   - The zero value of HashMap is not usable; construct with New.
 package hashindex
 
@@ -23,7 +25,7 @@ import (
 
 const (
 	// NStripes is the number of independently-locked shards.
-	// Must be a power of two so shard = bucketIdx & (NStripes-1) works.
+	// Must be a power of two.
 	NStripes = 16
 
 	defaultInitBuckets = 16  // must be >= NStripes and a power of two
@@ -32,31 +34,32 @@ const (
 	minBuckets         = 16  // never shrink below this
 )
 
-// entry is one node in a bucket's chain.
+// entry is one node in a bucket chain.
 type entry[K comparable, V any] struct {
 	key   K
 	value V
 	next  *entry[K, V]
 }
 
-// Hasher maps a key to a uint64 hash.  The hash need not be in any particular
-// range; the table takes it modulo the bucket count internally.
+// Hasher maps a key to a uint64 hash. The table reduces it to a bucket index.
 type Hasher[K comparable] func(key K) uint64
 
 // HashMap is a generic concurrent hash table.
-// K must be comparable (Go built-in constraint); V can be anything.
 type HashMap[K comparable, V any] struct {
 	hasher  Hasher[K]
 	stripes [NStripes]sync.RWMutex
 
-	// mu protects the buckets slice pointer and nBuckets during rehash.
-	// Normal reads/writes only hold a stripe lock.  Rehash holds mu + all
-	// stripe write-locks to swap the backing array atomically.
+	// mu protects buckets and nBuckets. Rehash replaces them while holding mu
+	// and every stripe write-lock.
 	mu       sync.Mutex
 	buckets  []*entry[K, V]
 	nBuckets int
 
-	// count is updated atomically so Len() is O(1) without any lock.
+	// gen counts how many times rehash has replaced the backing array. It only
+	// changes while every stripe write-lock is held.
+	gen atomic.Uint64
+
+	// count is updated atomically so Len is O(1) without any lock.
 	count atomic.Int64
 }
 
@@ -80,190 +83,169 @@ func (h *HashMap[K, V]) Len() int {
 	return int(h.count.Load())
 }
 
-// -------------------------------------------------------------------------
-// Shard helpers
-// -------------------------------------------------------------------------
-
 // stripe returns the stripe index for a given bucket index.
 func stripe(bucketIdx, nBuckets int) int {
-	// Distribute evenly: stride = nBuckets / NStripes buckets per shard.
-	// Because both nBuckets and NStripes are powers of two, this is exact.
 	return bucketIdx / (nBuckets / NStripes)
 }
 
-// locate returns (bucket index, stripe index) for a key, given the current
-// number of buckets.  Called while holding at least the stripe's read-lock
-// (caller already snapped nBuckets).
+// locate returns (bucket index, stripe index) for a key in a table of nb buckets.
 func (h *HashMap[K, V]) locate(key K, nb int) (int, int) {
 	hash := h.hasher(key)
 	bi := int(hash) & (nb - 1) // nb is always a power of two
 	if bi < 0 {
 		bi = -bi
 	}
-	si := stripe(bi, nb)
-	return bi, si
+	return bi, stripe(bi, nb)
 }
 
-// -------------------------------------------------------------------------
-// Get
-// -------------------------------------------------------------------------
+// snapshot returns the current backing array, its size and its generation.
+func (h *HashMap[K, V]) snapshot() ([]*entry[K, V], int, uint64) {
+	h.mu.Lock()
+	buckets, nb, gen := h.buckets, h.nBuckets, h.gen.Load()
+	h.mu.Unlock()
+	return buckets, nb, gen
+}
+
+// acquire locks the stripe that owns key and returns the table it locked
+// against, with the bucket and stripe index for key.
+//
+// A rehash can replace the table between reading it and taking the stripe
+// lock. Operating on the old array would lose writes and miss keys, so
+// acquire re-checks the generation once the lock is held and retries if it
+// changed. Rehash needs every stripe lock to replace the table, so after the
+// check passes the table cannot change until the caller releases the stripe.
+func (h *HashMap[K, V]) acquire(key K, write bool) ([]*entry[K, V], int, int, int) {
+	for {
+		buckets, nb, gen := h.snapshot()
+		bi, si := h.locate(key, nb)
+		if write {
+			h.stripes[si].Lock()
+		} else {
+			h.stripes[si].RLock()
+		}
+		if h.gen.Load() == gen {
+			return buckets, nb, bi, si
+		}
+		if write {
+			h.stripes[si].Unlock()
+		} else {
+			h.stripes[si].RUnlock()
+		}
+	}
+}
 
 // Get returns the value for key and true if found; zero value and false otherwise.
 func (h *HashMap[K, V]) Get(key K) (V, bool) {
-	h.mu.Lock()
-	buckets := h.buckets
-	nb := h.nBuckets
-	h.mu.Unlock()
-
-	bi, si := h.locate(key, nb)
-	h.stripes[si].RLock()
-	e := buckets[bi]
-	for e != nil {
+	buckets, _, bi, si := h.acquire(key, false)
+	defer h.stripes[si].RUnlock()
+	for e := buckets[bi]; e != nil; e = e.next {
 		if e.key == key {
-			v := e.value
-			h.stripes[si].RUnlock()
-			return v, true
+			return e.value, true
 		}
-		e = e.next
 	}
-	h.stripes[si].RUnlock()
 	var zero V
 	return zero, false
 }
 
-// -------------------------------------------------------------------------
-// Set
-// -------------------------------------------------------------------------
-
 // Set inserts or updates the value for key.
 // Returns true if this was a new insertion, false if an existing key was updated.
 func (h *HashMap[K, V]) Set(key K, value V) bool {
-	h.mu.Lock()
-	buckets := h.buckets
-	nb := h.nBuckets
-	h.mu.Unlock()
-
-	bi, si := h.locate(key, nb)
-	h.stripes[si].Lock()
-	e := buckets[bi]
-	for e != nil {
+	buckets, nb, bi, si := h.acquire(key, true)
+	for e := buckets[bi]; e != nil; e = e.next {
 		if e.key == key {
 			e.value = value
 			h.stripes[si].Unlock()
-			return false // update
+			return false
 		}
-		e = e.next
 	}
-	// Insert at head of chain.
 	buckets[bi] = &entry[K, V]{key: key, value: value, next: buckets[bi]}
+	n := h.count.Add(1)
 	h.stripes[si].Unlock()
 
-	n := h.count.Add(1)
-	// Check if rehash is needed (rough check without lock — exact check inside rehash).
+	// Rough check without a lock; rehash repeats it under its own locks.
 	if float64(n) > maxLoadFactor*float64(nb) {
 		h.rehash(nb * 2)
 	}
 	return true
 }
 
-// -------------------------------------------------------------------------
-// Delete
-// -------------------------------------------------------------------------
-
 // Delete removes the key from the map.
 // Returns true if the key was found and deleted, false if not present.
 func (h *HashMap[K, V]) Delete(key K) bool {
-	h.mu.Lock()
-	buckets := h.buckets
-	nb := h.nBuckets
-	h.mu.Unlock()
-
-	bi, si := h.locate(key, nb)
-	h.stripes[si].Lock()
-	prev := (*entry[K, V])(nil)
-	e := buckets[bi]
-	for e != nil {
-		if e.key == key {
-			if prev == nil {
-				buckets[bi] = e.next
-			} else {
-				prev.next = e.next
-			}
-			h.stripes[si].Unlock()
-			n := h.count.Add(-1)
-			// Shrink if load falls too low and we're above minBuckets.
-			if nb > minBuckets && float64(n) < minLoadFactor*float64(nb)/2 {
-				h.rehash(nb / 2)
-			}
-			return true
+	buckets, nb, bi, si := h.acquire(key, true)
+	var prev *entry[K, V]
+	for e := buckets[bi]; e != nil; prev, e = e, e.next {
+		if e.key != key {
+			continue
 		}
-		prev = e
-		e = e.next
+		if prev == nil {
+			buckets[bi] = e.next
+		} else {
+			prev.next = e.next
+		}
+		n := h.count.Add(-1)
+		h.stripes[si].Unlock()
+		if nb > minBuckets && float64(n) < minLoadFactor*float64(nb)/2 {
+			h.rehash(nb / 2)
+		}
+		return true
 	}
 	h.stripes[si].Unlock()
 	return false
 }
 
-// -------------------------------------------------------------------------
-// Scan
-// -------------------------------------------------------------------------
-
 // Scan calls fn for every key-value pair in the map in an unspecified order.
 // fn returning false stops iteration early.
-// Scan takes a consistent snapshot of each stripe (stripe-by-stripe), so it
-// is safe under concurrent modifications, but does not provide a
-// point-in-time snapshot of the entire map.
+//
+// Scan copies the contents while holding every stripe read-lock, releases the
+// locks, and then calls fn on the copy. It therefore sees a point-in-time
+// view of the map, and fn may safely call back into the same map. The cost is
+// one temporary copy of the keys and values per Scan.
 func (h *HashMap[K, V]) Scan(fn func(key K, value V) bool) bool {
-	h.mu.Lock()
-	buckets := h.buckets
-	nb := h.nBuckets
-	h.mu.Unlock()
-
 	for si := 0; si < NStripes; si++ {
 		h.stripes[si].RLock()
-		bucketStart := si * (nb / NStripes)
-		bucketEnd := bucketStart + (nb / NStripes)
-		var stop bool
-		for bi := bucketStart; bi < bucketEnd; bi++ {
-			for e := buckets[bi]; e != nil; e = e.next {
-				if !fn(e.key, e.value) {
-					stop = true
-					break
-				}
-			}
-			if stop {
-				break
-			}
+	}
+	buckets, _, _ := h.snapshot()
+	n := h.Len()
+	if n < 0 {
+		n = 0
+	}
+	keys := make([]K, 0, n)
+	values := make([]V, 0, n)
+	for _, head := range buckets {
+		for e := head; e != nil; e = e.next {
+			keys = append(keys, e.key)
+			values = append(values, e.value)
 		}
+	}
+	for si := NStripes - 1; si >= 0; si-- {
 		h.stripes[si].RUnlock()
-		if stop {
+	}
+
+	for i := range keys {
+		if !fn(keys[i], values[i]) {
 			return false
 		}
 	}
 	return true
 }
 
-// -------------------------------------------------------------------------
-// Rehash
-// -------------------------------------------------------------------------
-
 // rehash rebuilds the table with newSize buckets.
-// It acquires all stripe write-locks (in stripe order) to prevent any
-// concurrent reads or writes during the swap.
+// It acquires every stripe write-lock, in stripe order, so that no read or
+// write can run while the backing array is replaced.
 func (h *HashMap[K, V]) rehash(newSize int) {
 	newSize = nextPow2(newSize)
 	if newSize < minBuckets {
 		newSize = minBuckets
 	}
 
-	// Acquire the table-level mutex to read and (later) update nBuckets.
+	// Cheap check first: another goroutine may already have rehashed.
 	h.mu.Lock()
 	oldNB := h.nBuckets
-	// Re-check under lock: another goroutine may have already rehashed.
 	n := int(h.count.Load())
 	if newSize > oldNB && float64(n) <= maxLoadFactor*float64(oldNB) {
 		h.mu.Unlock()
-		return // no longer needed
+		return
 	}
 	if newSize < oldNB && (newSize < minBuckets || float64(n) >= minLoadFactor*float64(newSize)/2) {
 		h.mu.Unlock()
@@ -271,33 +253,25 @@ func (h *HashMap[K, V]) rehash(newSize int) {
 	}
 	h.mu.Unlock()
 
-	// Lock all stripes in order (deadlock-free since we always go 0..NStripes-1).
 	for si := 0; si < NStripes; si++ {
 		h.stripes[si].Lock()
 	}
 
-	// Re-read under all locks held.
+	// Check again with every stripe held.
 	h.mu.Lock()
 	oldBuckets := h.buckets
 	oldNB = h.nBuckets
-
-	// Double-check again — concurrent rehash may have already done it.
 	n = int(h.count.Load())
-	alreadyDone := false
+	alreadyDone := newSize == oldNB
 	if newSize > oldNB && float64(n) <= maxLoadFactor*float64(oldNB) {
 		alreadyDone = true
 	}
 	if newSize < oldNB && (newSize < minBuckets || float64(n) >= minLoadFactor*float64(newSize)/2) {
 		alreadyDone = true
 	}
-	// Also skip if sizes match.
-	if newSize == oldNB {
-		alreadyDone = true
-	}
 
 	if !alreadyDone {
 		newBuckets := make([]*entry[K, V], newSize)
-		// Redistribute all entries.
 		for _, head := range oldBuckets {
 			for e := head; e != nil; {
 				next := e.next
@@ -312,6 +286,7 @@ func (h *HashMap[K, V]) rehash(newSize int) {
 		}
 		h.buckets = newBuckets
 		h.nBuckets = newSize
+		h.gen.Add(1)
 	}
 	h.mu.Unlock()
 
@@ -319,10 +294,6 @@ func (h *HashMap[K, V]) rehash(newSize int) {
 		h.stripes[si].Unlock()
 	}
 }
-
-// -------------------------------------------------------------------------
-// Utility
-// -------------------------------------------------------------------------
 
 // nextPow2 returns the smallest power of two >= n (minimum 1).
 func nextPow2(n int) int {
