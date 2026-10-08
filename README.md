@@ -1,5 +1,7 @@
 # memdb
 
+[![ci](https://github.com/pandeylakshya207-max/memdb/actions/workflows/ci.yml/badge.svg)](https://github.com/pandeylakshya207-max/memdb/actions/workflows/ci.yml)
+
 A from-scratch relational database engine written in Go. No external dependencies.
 
 **github.com/pandeylakshya207-max/memdb**
@@ -36,12 +38,15 @@ Generic B-Tree with configurable minimum degree `t`. Used as the primary storage
 - Full structural invariant checker used after every mutation in tests
 
 ### `hashindex` — Concurrent hash table
+
 Generic, dynamically-resizing hash map with stripe-sharded locking.
 
-- 16-stripe `sync.RWMutex` sharding — reads on different key ranges never contend
+- 16 stripes, each with its own `sync.RWMutex`; a resize takes all of them
+- Every operation re-checks a table generation counter after locking, and retries if a resize replaced the table in between
 - Dynamic rehash: doubles at load > 2.0, halves at load < 0.25
-- FNV-1a for strings, Murmur3-mix for integers
-- `atomic.Int64` for O(1) `Len()` without any lock
+- FNV-1a for strings, a Murmur3-style mix for integers
+- `atomic.Int64` count, so `Len()` takes no lock
+- `Scan` works on a point-in-time copy, so its callback may call back into the map
 
 ### `page` — Page file + buffer pool
 Fixed-size (4096 byte) page manager over an OS file, plus an LRU buffer pool.
@@ -184,7 +189,7 @@ durable.Exec("INSERT INTO t (id, val) VALUES (1, 'hello')")
 | `db` | 13 | 81.3% | Crash recovery, multi-session, NULL persistence |
 | `server` | 10 | 90.2% | Real TCP connections, concurrent clients |
 
-All packages pass `go test ./... -race`. No external dependencies.
+CI runs `go vet` and the full test suite on Linux and Windows, and the race detector on Linux. No external dependencies.
 
 ```sh
 go test ./... -race    # full suite under race detector
@@ -209,13 +214,15 @@ Every bug was caught by the test suite, not discovered in production.
 | 8 | `sql` | `DELETE` with composite PK used only `row[0]` — first column always deleted regardless of WHERE | `TestExecDeleteCompositePK` |
 | 9 | `db` | All DML used `PrintStmt(s)` to re-serialise the AST — `PrintStmt` produces human-readable text not valid SQL, causing parse errors on every write | `TestCreateTablePersists` |
 | 10 | `db` | `DISTINCT` parsed but ignored — no operator wired into the plan | `TestExecDistinct` |
+| 11 | `hashindex` | `Get`, `Set` and `Delete` read the bucket array before taking the stripe lock, so a concurrent rehash left them working on a discarded array: writes were lost and existing keys were missed. It only showed up on a machine with many cores. Fixed with a generation check after locking | `TestConcurrentSetGet`, `TestConcurrentSetDelete`, `TestConcurrentRehashSafety` |
+| 12 | `db` (test) | `TestCrashRecovery` left WAL files open, so removing the temp directory failed on Windows | Running the suite on Windows |
 
 ---
 
 ## Design decisions
 
 **Why a row-level WAL in `db` instead of using the page-level WAL from `wal`?**
-The page-level WAL is correct for a buffer-pool-based storage engine where the B-Tree lives on disk pages. Since memdb's B-Tree is in-memory (Weeks 1–4), the right recovery log is at the row level: replay INSERTs and DELETEs to reconstruct the B-Tree. This is simpler and produces a smaller, more readable WAL. A future persistent B-Tree would use the page-level WAL directly.
+The page-level WAL is correct for a buffer-pool-based storage engine where the B-Tree lives on disk pages. Since memdb's B-Tree is in-memory, the right recovery log is at the row level: replay INSERTs and DELETEs to reconstruct the B-Tree. This is simpler and produces a smaller, more readable WAL. A future persistent B-Tree would use the page-level WAL directly.
 
 **Why nested-loop join instead of hash join?**
 Nested-loop join is O(N×M) but correct and simple to implement. Hash join would require hashing one side into memory, which adds complexity without changing the correctness story. For the query engine's scope (in-memory tables, no query optimiser) NLJ is appropriate.
