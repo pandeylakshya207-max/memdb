@@ -181,15 +181,15 @@ durable.Exec("INSERT INTO t (id, val) VALUES (1, 'hello')")
 | Package | Tests | Coverage | Notes |
 |---|---|---|---|
 | `btree` | 34 | 93.0% | Exhaustive permutation tests, random stress |
-| `hashindex` | 23 | 95.7% | Concurrent stress under `-race` |
+| `hashindex` | 23 | 93-95% | Concurrent stress under `-race` |
 | `page` | 20 | 86.8% | Free-list, LRU eviction, dirty write-back |
 | `wal` | 18 | 88.8% | Crash simulation, CRC corruption, checkpoint recovery |
 | `query` | 61 | 83.9% | All operators, pipeline composition, large table |
-| `sql` | 54 | 77.2% | Parser fuzzing, end-to-end Exec tests |
-| `db` | 13 | 81.3% | Crash recovery, multi-session, NULL persistence |
+| `sql` | 60 | 79.4% | Parser fuzzing, end-to-end Exec tests |
+| `db` | 16 | 80.0% | Crash recovery, multi-session, NULL persistence |
 | `server` | 10 | 90.2% | Real TCP connections, concurrent clients |
 
-CI runs `go vet` and the full test suite on Linux and Windows, and the race detector on Linux. No external dependencies.
+CI runs `go vet` and the full test suite (242 tests) on Linux and Windows, and the race detector on Linux. No external dependencies.
 
 ```sh
 go test ./... -race    # full suite under race detector
